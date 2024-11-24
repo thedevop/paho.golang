@@ -623,6 +623,65 @@ func TestClientConfig_buildConnectPacket(t *testing.T) {
 	}
 }
 
+func TestNewUpState(t *testing.T) {
+	c := paho.NewClient(paho.ClientConfig{})
+	cs := NewUpState(c)
+
+	if cs.cli != c {
+		t.Error("client didn't match")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+
+	select {
+	case _, ok := <-cs.connUp:
+		if ok {
+			t.Error("connUp should be closed")
+		}
+	case <-ctx.Done():
+		t.Error("connUp should be closed")
+		t.FailNow()
+	}
+
+	select {
+	case _, ok := <-cs.connDown:
+		if !ok {
+			t.Error("connDown should be opened")
+		}
+	case <-ctx.Done():
+	}
+}
+
+func TestDownState(t *testing.T) {
+	cs := NewDownState()
+
+	if cs.cli != nil {
+		t.Error("client should be nil")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+
+	select {
+	case _, ok := <-cs.connDown:
+		if ok {
+			t.Error("connDown should be closed")
+		}
+	case <-ctx.Done():
+		t.Error("connDown should be closed")
+		t.FailNow()
+	}
+
+	select {
+	case _, ok := <-cs.connUp:
+		if !ok {
+			t.Error("connDown should be opened")
+		}
+	case <-ctx.Done():
+	}
+}
+
 // Example of using ConnectPacketBuilder to extract server password from URL
 func ExampleClientConfig_ConnectPacketBuilder() {
 	serverURL, _ := url.Parse("mqtt://mqtt_user:mqtt_pass@127.0.0.1:1883")

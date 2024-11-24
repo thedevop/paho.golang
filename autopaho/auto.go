@@ -25,6 +25,7 @@ import (
 	"net/http"
 	"net/url"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/eclipse/paho.golang/autopaho/queue"
@@ -112,12 +113,38 @@ type ClientConfig struct {
 	paho.ClientConfig
 }
 
+// ClientState stores client states.
+type ClientState struct {
+	cli      *paho.Client  // The client will only be set when the connection is up (only updated within NewConnection goRoutine)
+	connUp   chan struct{} // Channel is closed when the connection is up
+	connDown chan struct{} // Channel is closed when the connection is down
+}
+
+// NewUpState returns a new ClientState with cli set to c, and connUp closed.
+func NewUpState(c *paho.Client) *ClientState {
+	cs := ClientState{
+		cli:      c,
+		connUp:   make(chan struct{}),
+		connDown: make(chan struct{}),
+	}
+	close(cs.connUp)
+	return &cs
+}
+
+// NewUpState returns a new ClientState with cli set to nil, with connDown closed.
+func NewDownState() *ClientState {
+	cs := ClientState{
+		cli:      nil,
+		connUp:   make(chan struct{}),
+		connDown: make(chan struct{}),
+	}
+	close(cs.connDown)
+	return &cs
+}
+
 // ConnectionManager manages the connection with the server and provides the ability to publish messages
 type ConnectionManager struct {
-	cli      *paho.Client  // The client will only be set when the connection is up (only updated within NewServerConnection goRoutine)
-	connUp   chan struct{} // Channel is closed when the connection is up (only valid if cli == nil; must lock Mu to read)
-	connDown chan struct{} // Channel is closed when the connection is down (only valid if cli != nil; must lock Mu to read)
-	mu       sync.Mutex    // protects all of the above
+	state atomic.Pointer[ClientState] // The current state of the client
 
 	cfg       ClientConfig       // The config passed to NewConnection (stored to enable getters)
 	cancelCtx context.CancelFunc // Calling this will shut things down cleanly
@@ -275,8 +302,6 @@ func NewConnection(ctx context.Context, cfg ClientConfig) (*ConnectionManager, e
 	}
 	innerCtx, cancel := context.WithCancel(ctx)
 	c := ConnectionManager{
-		cli:       nil,
-		connUp:    make(chan struct{}),
 		cfg:       cfg,
 		cancelCtx: cancel,
 		queue:     cfg.Queue,
@@ -284,6 +309,7 @@ func NewConnection(ctx context.Context, cfg ClientConfig) (*ConnectionManager, e
 		errors:    cfg.Errors,
 		debug:     cfg.Debug,
 	}
+	c.state.Store(NewDownState())
 	errChan := make(chan error, 1) // Will be sent one, and only one error per connection (buffered to prevent deadlock)
 	firstConnection := true        // Set to false after we have successfully connected
 
@@ -311,11 +337,9 @@ func NewConnection(ctx context.Context, cfg ClientConfig) (*ConnectionManager, e
 				break mainLoop // Only occurs when context is cancelled
 			}
 
-			c.mu.Lock()
-			c.cli = cli
-			c.connDown = make(chan struct{})
-			close(c.connUp)
-			c.mu.Unlock()
+			state := NewUpState(cli)
+			prevState := c.state.Swap(state)
+			close(prevState.connUp)
 
 			if cfg.OnConnectionUp != nil {
 				cfg.OnConnectionUp(&c, connAck)
@@ -342,7 +366,7 @@ func NewConnection(ctx context.Context, cfg ClientConfig) (*ConnectionManager, e
 					dp = cfg.DisconnectPacketBuilder()
 				}
 				if dp != nil {
-					if err = c.cli.Disconnect(dp); err != nil {
+					if err = state.cli.Disconnect(dp); err != nil {
 						cfg.Debug.Printf("mainLoop: disconnect returned error: %s\n", err)
 					}
 				}
@@ -354,11 +378,8 @@ func NewConnection(ctx context.Context, cfg ClientConfig) (*ConnectionManager, e
 				break mainLoop
 			}
 			<-cli.Done() // Wait for the client to fully shutdown
-			c.mu.Lock()
-			c.cli = nil
-			close(c.connDown)
-			c.connUp = make(chan struct{})
-			c.mu.Unlock()
+			prevState = c.state.Swap(NewDownState())
+			close(prevState.connDown)
 			cfg.Debug.Printf("mainLoop: connection to server lost (%s); will reconnect\n", err)
 		}
 		cfg.Debug.Println("mainLoop: connection manager has terminated")
@@ -387,9 +408,7 @@ func (c *ConnectionManager) Done() <-chan struct{} {
 // if context is cancelled). If you require more complex connection management then consider using the OnConnectionUp
 // callback.
 func (c *ConnectionManager) AwaitConnection(ctx context.Context) error {
-	c.mu.Lock()
-	ch := c.connUp
-	c.mu.Unlock()
+	ch := c.state.Load().connUp
 
 	select {
 	case <-ch:
@@ -407,9 +426,7 @@ func (c *ConnectionManager) AwaitConnection(ctx context.Context) error {
 // server until either a successful Auth packet is passed back, or a Disconnect
 // is received.
 func (c *ConnectionManager) Authenticate(ctx context.Context, a *paho.Auth) (*paho.AuthResponse, error) {
-	c.mu.Lock()
-	cli := c.cli
-	c.mu.Unlock()
+	cli := c.state.Load().cli
 
 	if cli == nil {
 		return nil, ConnectionDownError
@@ -422,9 +439,7 @@ func (c *ConnectionManager) Authenticate(ctx context.Context, a *paho.Auth) (*pa
 // a response Suback, or for the timeout to fire. Any response Suback
 // is returned from the function, along with any errors.
 func (c *ConnectionManager) Subscribe(ctx context.Context, s *paho.Subscribe) (*paho.Suback, error) {
-	c.mu.Lock()
-	cli := c.cli
-	c.mu.Unlock()
+	cli := c.state.Load().cli
 
 	if cli == nil {
 		return nil, ConnectionDownError
@@ -437,9 +452,7 @@ func (c *ConnectionManager) Subscribe(ctx context.Context, s *paho.Subscribe) (*
 // a response Unsuback, or for the timeout to fire. Any response Unsuback
 // is returned from the function, along with any errors.
 func (c *ConnectionManager) Unsubscribe(ctx context.Context, u *paho.Unsubscribe) (*paho.Unsuback, error) {
-	c.mu.Lock()
-	cli := c.cli
-	c.mu.Unlock()
+	cli := c.state.Load().cli
 
 	if cli == nil {
 		return nil, ConnectionDownError
@@ -452,9 +465,7 @@ func (c *ConnectionManager) Unsubscribe(ctx context.Context, u *paho.Unsubscribe
 // or for the timeout to fire.
 // Any response message is returned from the function, along with any errors.
 func (c *ConnectionManager) Publish(ctx context.Context, p *paho.Publish) (*paho.PublishResponse, error) {
-	c.mu.Lock()
-	cli := c.cli
-	c.mu.Unlock()
+	cli := c.state.Load().cli
 
 	if cli == nil {
 		return nil, ConnectionDownError
@@ -490,11 +501,10 @@ func (c *ConnectionManager) PublishViaQueue(ctx context.Context, p *QueuePublish
 // TerminateConnectionForTest closes the active connection (if any). This function is intended for testing only, it
 // simulates connection loss which supports testing QOS1 and 2 message delivery.
 func (c *ConnectionManager) TerminateConnectionForTest() {
-	c.mu.Lock()
-	if c.cli != nil {
-		c.cli.TerminateConnectionForTest()
+	cli := c.state.Load().cli
+	if cli != nil {
+		cli.TerminateConnectionForTest()
 	}
-	c.mu.Unlock()
 }
 
 // AddOnPublishReceived adds a function that will be called when a PUBLISH is received
@@ -514,15 +524,12 @@ func (c *ConnectionManager) AddOnPublishReceived(f func(PublishReceived) (bool, 
 		})
 	}
 	var removeFromClient func()
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.cli != nil {
-		removeFromClient = c.cli.AddOnPublishReceived(fn)
+	cs := c.state.Load()
+	if cs.cli != nil {
+		removeFromClient = cs.cli.AddOnPublishReceived(fn)
 	}
 
 	return func() {
-		c.mu.Lock()
-		defer c.mu.Unlock()
 		if removeFromClient != nil {
 			removeFromClient()
 		}
@@ -541,10 +548,9 @@ connectionLoop:
 		}
 
 		c.debug.Println("queue got connection")
-		c.mu.Lock()
-		cli := c.cli
-		connDown := c.connDown
-		c.mu.Unlock()
+		state := c.state.Load()
+		cli := state.cli
+		connDown := state.connDown
 		if cli == nil { // Possible connection dropped immediately
 			continue
 		}
